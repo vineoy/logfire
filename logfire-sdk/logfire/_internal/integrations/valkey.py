@@ -1,11 +1,17 @@
 from __future__ import annotations
 
-import functools
 import logging
-from typing import Any
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
+from threading import Event, Lock
+from typing import Any, TypeVar
+
+from logfire.integrations.valkey import RequestHook, RequestHookContext, ResponseHook, ResponseHookContext
 
 try:
-    from logfire.integrations.valkey import RequestHook, ResponseHook
+    from valkey import Valkey
+    from valkey.asyncio import Valkey as AsyncValkey
+    from valkey.exceptions import ResponseError
 except ModuleNotFoundError as exc:
     if exc.name != 'valkey':
         raise
@@ -15,20 +21,19 @@ except ModuleNotFoundError as exc:
         "    pip install 'logfire[valkey]'"
     ) from exc
 
-from opentelemetry import trace
-from opentelemetry.trace import SpanKind
-from wrapt import wrap_function_wrapper
+from opentelemetry.trace import Span, SpanKind, StatusCode, Tracer
+from wrapt import FunctionWrapper
 
 from logfire._internal.constants import ATTRIBUTES_MESSAGE_KEY
-from logfire._internal.utils import truncate_string
+from logfire._internal.utils import is_instrumentation_suppressed, log_internal_error
 
 _logger = logging.getLogger(__name__)
 
-_CLASS = 'Valkey'
 _METHOD = 'execute_command'
 
-_originals: list[tuple[Any, str, Any]] = []
-_is_instrumented = False
+_lock = Lock()
+_active_installation: Event | None = None
+_originals: list[tuple[type[Valkey] | type[AsyncValkey], Any, Any]] = []
 
 
 def instrument_valkey(
@@ -36,44 +41,46 @@ def instrument_valkey(
     capture_statement: bool,
     request_hook: RequestHook | None,
     response_hook: ResponseHook | None,
-    tracer_provider: Any | None = None,
-    **kwargs: Any,
+    tracer: Tracer,
 ) -> None:
     """Instrument the `valkey` module so that spans are automatically created for each operation.
 
     See the `Logfire.instrument_valkey` method for details.
     """
-    global _is_instrumented
-    if _is_instrumented:
-        return
+    global _active_installation
+    with _lock:
+        if _active_installation is not None:
+            return
 
-    tracer = trace.get_tracer(__name__, tracer_provider=tracer_provider)
-    sync_wrapper = _traced_sync_wrapper(tracer, capture_statement, request_hook, response_hook)
-    async_wrapper = _traced_async_wrapper(tracer, capture_statement, request_hook, response_hook)
+        installation = Event()
+        patches: list[tuple[type[Valkey] | type[AsyncValkey], Any, Any]] = []
+        for cls, wrapper in (
+            (Valkey, _traced_sync_wrapper(tracer, capture_statement, request_hook, response_hook)),
+            (AsyncValkey, _traced_async_wrapper(tracer, capture_statement, request_hook, response_hook)),
+        ):
+            original = vars(cls)[_METHOD]
+            patched = FunctionWrapper(original, wrapper, enabled=installation.is_set)
+            patches.append((cls, original, patched))
 
-    import valkey.asyncio.client
-    import valkey.client
-
-    for module, wrapper in (
-        (valkey.client, sync_wrapper),
-        (valkey.asyncio.client, async_wrapper),
-    ):
-        cls = getattr(module, _CLASS)
-        _originals.append((cls, _METHOD, getattr(cls, _METHOD)))
-        wrap_function_wrapper(module.__name__, f'{_CLASS}.{_METHOD}', wrapper)
-
-    _is_instrumented = True
+        for cls, _, patched in patches:
+            setattr(cls, _METHOD, patched)
+        _originals.extend(patches)
+        installation.set()
+        _active_installation = installation
 
 
 def uninstrument_valkey() -> None:
     """Remove Valkey instrumentation applied by `instrument_valkey`."""
-    global _is_instrumented
-    if not _is_instrumented:
-        return
-    while _originals:
-        cls, method, original = _originals.pop()
-        setattr(cls, method, original)
-    _is_instrumented = False
+    global _active_installation
+    with _lock:
+        if _active_installation is None:
+            return
+        _active_installation.clear()
+        while _originals:
+            cls, original, patched = _originals.pop()
+            if vars(cls).get(_METHOD) is patched:
+                setattr(cls, _METHOD, original)
+        _active_installation = None
 
 
 def _arg_to_str(arg: Any) -> str:
@@ -82,50 +89,57 @@ def _arg_to_str(arg: Any) -> str:
     return str(arg)
 
 
-def _first_arg_tokens(args: tuple[Any, ...]) -> list[str]:
+def _command_tokens(args: tuple[Any, ...]) -> list[str]:
     if not args:
         return []
-    return _arg_to_str(args[0]).split()
+    first = args[0]
+    if isinstance(first, bytes):
+        first = bytes.decode(first, errors='replace')
+    elif isinstance(first, bytearray):
+        first = bytearray.decode(first, errors='replace')
+    return str.split(first) if isinstance(first, str) else []
 
 
-def _span_name(args: tuple[Any, ...]) -> str:
-    tokens = _first_arg_tokens(args)
-    if not tokens:
-        return 'valkey'
-    return tokens[0].upper()
+def _span_name(tokens: list[str]) -> str:
+    if tokens and len(tokens[0]) <= 32 and tokens[0].isascii() and tokens[0].isprintable():
+        return tokens[0].upper()
+    return 'valkey'
 
 
-def _expanded_args_length(args: tuple[Any, ...]) -> int:
-    tokens = _first_arg_tokens(args)
-    if not args:
-        return 0
-    if not tokens:
-        return len(args)
-    return len(tokens) + len(args) - 1
+def _set_attributes(
+    span: Span,
+    instance: Valkey | AsyncValkey,
+    args: tuple[Any, ...],
+    tokens: list[str],
+    command: str,
+    capture_statement: bool,
+) -> None:
+    if not span.is_recording():
+        return
+    try:
+        _record_attributes(span, instance, args, tokens, command, capture_statement)
+    except Exception:
+        log_internal_error()
 
 
-def _sanitized_statement(args: tuple[Any, ...]) -> str:
-    if not args:
-        return ''
-    tokens = _first_arg_tokens(args)
-    if not tokens:
-        return ' '.join(['?'] * len(args))
-    return ' '.join([tokens[0]] + ['?'] * (len(tokens) + len(args) - 2))
-
-
-def _display_statement(args: tuple[Any, ...], *, capture_statement: bool) -> tuple[str, str]:
-    if capture_statement:
-        full = ' '.join(map(_arg_to_str, args))
-        truncate_value = functools.partial(truncate_string, max_length=20, middle='...')
-        return full, ' '.join(map(truncate_value, map(_arg_to_str, args)))
-    sanitized = _sanitized_statement(args)
-    return sanitized, sanitized
-
-
-def _set_attributes(span: Any, instance: Any, args: tuple[Any, ...], statement: str, display: str) -> None:
+def _record_attributes(
+    span: Span,
+    instance: Valkey | AsyncValkey,
+    args: tuple[Any, ...],
+    tokens: list[str],
+    command: str,
+    capture_statement: bool,
+) -> None:
+    arg_count = len(args) + max(0, len(tokens) - 1)
+    display = (
+        ' '.join([command] + ['?'] * (arg_count - 1)) if tokens and command != 'valkey' else ' '.join(['?'] * arg_count)
+    )
     span.set_attribute('db.system', 'valkey')
-    span.set_attribute('db.statement', statement)
-    span.set_attribute('db.valkey.args_length', _expanded_args_length(args))
+    span.set_attribute('db.statement', display)
+    # These commands can carry credentials without recognizable secret names.
+    if capture_statement and command not in {'ACL', 'AUTH', 'CONFIG', 'HELLO', 'MIGRATE', 'valkey'}:
+        span.set_attribute('db.valkey.command', ' '.join(map(_arg_to_str, args)))
+    span.set_attribute('db.valkey.args_length', arg_count)
     span.set_attribute(ATTRIBUTES_MESSAGE_KEY, display)
     pool = getattr(instance, 'connection_pool', None)
     connection_kwargs: dict[str, Any] = getattr(pool, 'connection_kwargs', {})
@@ -140,48 +154,75 @@ def _set_attributes(span: Any, instance: Any, args: tuple[Any, ...], statement: 
         span.set_attribute('db.valkey.database_index', db)
 
 
-def _execute_hook(hook: Any | None, *args: Any) -> None:
-    if hook is None:
-        return
+T = TypeVar('T')
+
+
+def _execute_hook(hook: Callable[[T], None], context: T) -> None:
     try:
-        hook(*args)
+        hook(context)
     except Exception:
         _logger.warning('Exception raised by hook %r', hook, exc_info=True)
 
 
+@contextmanager
+def _command_span(tracer: Tracer, command: str) -> Generator[Span, None, None]:
+    with tracer.start_as_current_span(
+        command, kind=SpanKind.CLIENT, record_exception=False, set_status_on_exception=False
+    ) as span:
+        try:
+            yield span
+        except ResponseError as exc:
+            # Valkey can include raw command arguments in server error messages.
+            span.set_status(StatusCode.ERROR)
+            span.add_event('exception', {'exception.type': type(exc).__qualname__})
+            raise
+        except Exception as exc:
+            span.set_status(StatusCode.ERROR)
+            span.record_exception(exc, escaped=True)
+            raise
+
+
 def _traced_sync_wrapper(
-    tracer: Any,
+    tracer: Tracer,
     capture_statement: bool,
     request_hook: RequestHook | None,
     response_hook: ResponseHook | None,
 ):
-    def wrapper(wrapped: Any, instance: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
-        statement, display = _display_statement(args, capture_statement=capture_statement)
-        with tracer.start_as_current_span(_span_name(args), kind=SpanKind.CLIENT) as span:
-            _set_attributes(span, instance, args, statement, display)
-            _execute_hook(request_hook, span, instance, *args, **kwargs)
-            # Exceptions propagate through the span, which records them automatically.
+    def wrapper(wrapped: Any, instance: Valkey, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        if is_instrumentation_suppressed():
+            return wrapped(*args, **kwargs)
+        tokens = _command_tokens(args)
+        command = _span_name(tokens)
+        with _command_span(tracer, command) as span:
+            _set_attributes(span, instance, args, tokens, command, capture_statement)
+            if request_hook is not None:
+                _execute_hook(request_hook, RequestHookContext(span, instance, args, kwargs.copy()))
             response = wrapped(*args, **kwargs)
-            _execute_hook(response_hook, span, instance, response)
+            if response_hook is not None:
+                _execute_hook(response_hook, ResponseHookContext(span, instance, response))
             return response
 
     return wrapper
 
 
 def _traced_async_wrapper(
-    tracer: Any,
+    tracer: Tracer,
     capture_statement: bool,
     request_hook: RequestHook | None,
     response_hook: ResponseHook | None,
 ):
-    async def wrapper(wrapped: Any, instance: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
-        statement, display = _display_statement(args, capture_statement=capture_statement)
-        with tracer.start_as_current_span(_span_name(args), kind=SpanKind.CLIENT) as span:
-            _set_attributes(span, instance, args, statement, display)
-            _execute_hook(request_hook, span, instance, *args, **kwargs)
-            # Exceptions propagate through the span, which records them automatically.
+    async def wrapper(wrapped: Any, instance: AsyncValkey, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        if is_instrumentation_suppressed():
+            return await wrapped(*args, **kwargs)
+        tokens = _command_tokens(args)
+        command = _span_name(tokens)
+        with _command_span(tracer, command) as span:
+            _set_attributes(span, instance, args, tokens, command, capture_statement)
+            if request_hook is not None:
+                _execute_hook(request_hook, RequestHookContext(span, instance, args, kwargs.copy()))
             response = await wrapped(*args, **kwargs)
-            _execute_hook(response_hook, span, instance, response)
+            if response_hook is not None:
+                _execute_hook(response_hook, ResponseHookContext(span, instance, response))
             return response
 
     return wrapper
